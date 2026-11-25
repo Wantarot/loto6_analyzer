@@ -1,0 +1,1 @@
+# loto6_analyzer
