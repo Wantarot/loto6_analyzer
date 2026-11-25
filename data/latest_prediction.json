@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "generated_at_jst": "2026-11-25 21:47:58 JST",
+  "target_draw_no": 2158,
+  "as_of_draw_no": 2157,
+  "as_of_draw_date": "2026-11-23",
+  "latest_result": {
+    "draw_no": 2157,
+    "draw_date": "2026-11-23",
+    "numbers": [
+      13,
+      20,
+      22,
+      34,
+      38,
+      39
+    ],
+    "numbers_str": "13-20-22-34-38-39",
+    "bonus": 33,
+    "set_ball": "F",
+    "carryover": 233461295
+  },
+  "config": {
+    "start_draw_no": 138,
+    "min_past_draws": 100,
+    "lgbm_weight": 0.5,
+    "pool_size": 12,
+    "n_tickets": 5,
+    "use_crowd_penalty": false
+  },
+  "set_ball_top3": [
+    {
+      "rank": 1,
+      "set_ball": "A",
+      "prob": 0.2644,
+      "last_gap": 11,
+      "hazard_prob": 0.3221,
+      "markov_prob": 0.1453
+    },
+    {
+      "rank": 2,
+      "set_ball": "C",
+      "prob": 0.2255,
+      "last_gap": 10,
+      "hazard_prob": 0.2736,
+      "markov_prob": 0.1204
+    },
+    {
+      "rank": 3,
+      "set_ball": "B",
+      "prob": 0.1918,
+      "last_gap": 9,
+      "hazard_prob": 0.228,
+      "markov_prob": 0.1055
+    }
+  ],
+  "pool_numbers": [
+    43,
+    37,
+    32,
+    6,
+    38,
+    35,
+    15,
+    10,
+    16,
+    36,
+    27,
+    3
+  ],
+  "top_numbers_detail": [
+    {
+      "rank": 1,
+      "number": 43,
+      "final_score": 0.14911,
+      "bayes_score": 0.15518,
+      "lgbm_score": 0.14303,
+      "score_lift": 1.0686,
+      "interval": 14,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 2,
+      "number": 37,
+      "final_score": 0.14678,
+      "bayes_score": 0.15368,
+      "lgbm_score": 0.13988,
+      "score_lift": 1.0519,
+      "interval": 4,
+      "is_pull": 0,
+      "is_slide": 1
+    },
+    {
+      "rank": 3,
+      "number": 32,
+      "final_score": 0.14642,
+      "bayes_score": 0.15203,
+      "lgbm_score": 0.14081,
+      "score_lift": 1.0494,
+      "interval": 13,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 4,
+      "number": 6,
+      "final_score": 0.14605,
+      "bayes_score": 0.15011,
+      "lgbm_score": 0.14199,
+      "score_lift": 1.0467,
+      "interval": 9,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 5,
+      "number": 38,
+      "final_score": 0.1459,
+      "bayes_score": 0.15229,
+      "lgbm_score": 0.13952,
+      "score_lift": 1.0456,
+      "interval": 0,
+      "is_pull": 1,
+      "is_slide": 1
+    },
+    {
+      "rank": 6,
+      "number": 35,
+      "final_score": 0.14339,
+      "bayes_score": 0.14692,
+      "lgbm_score": 0.13986,
+      "score_lift": 1.0276,
+      "interval": 1,
+      "is_pull": 0,
+      "is_slide": 1
+    },
+    {
+      "rank": 7,
+      "number": 15,
+      "final_score": 0.14327,
+      "bayes_score": 0.1481,
+      "lgbm_score": 0.13845,
+      "score_lift": 1.0268,
+      "interval": 2,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 8,
+      "number": 10,
+      "final_score": 0.1429,
+      "bayes_score": 0.14732,
+      "lgbm_score": 0.13849,
+      "score_lift": 1.0241,
+      "interval": 3,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 9,
+      "number": 16,
+      "final_score": 0.14254,
+      "bayes_score": 0.14529,
+      "lgbm_score": 0.1398,
+      "score_lift": 1.0216,
+      "interval": 9,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 10,
+      "number": 36,
+      "final_score": 0.14235,
+      "bayes_score": 0.14446,
+      "lgbm_score": 0.14024,
+      "score_lift": 1.0202,
+      "interval": 8,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 11,
+      "number": 27,
+      "final_score": 0.14164,
+      "bayes_score": 0.144,
+      "lgbm_score": 0.13929,
+      "score_lift": 1.0151,
+      "interval": 10,
+      "is_pull": 0,
+      "is_slide": 0
+    },
+    {
+      "rank": 12,
+      "number": 3,
+      "final_score": 0.14157,
+      "bayes_score": 0.14256,
+      "lgbm_score": 0.14059,
+      "score_lift": 1.0146,
+      "interval": 18,
+      "is_pull": 0,
+      "is_slide": 0
+    }
+  ],
+  "tickets": [
+    {
+      "ticket_id": 1,
+      "numbers": [
+        6,
+        15,
+        35,
+        37,
+        38,
+        43
+      ],
+      "numbers_str": "06-15-35-37-38-43",
+      "sum_value": 174,
+      "odd_count": 4,
+      "even_count": 2,
+      "score_sum": 0.8745,
+      "crowd_penalty": 0.0
+    },
+    {
+      "ticket_id": 2,
+      "numbers": [
+        6,
+        16,
+        32,
+        36,
+        37,
+        38
+      ],
+      "numbers_str": "06-16-32-36-37-38",
+      "sum_value": 165,
+      "odd_count": 1,
+      "even_count": 5,
+      "score_sum": 0.87005,
+      "crowd_penalty": 0.23
+    },
+    {
+      "ticket_id": 3,
+      "numbers": [
+        3,
+        6,
+        10,
+        15,
+        32,
+        37
+      ],
+      "numbers_str": "03-06-10-15-32-37",
+      "sum_value": 103,
+      "odd_count": 3,
+      "even_count": 3,
+      "score_sum": 0.867,
+      "crowd_penalty": 0.0
+    },
+    {
+      "ticket_id": 4,
+      "numbers": [
+        10,
+        27,
+        32,
+        35,
+        36,
+        43
+      ],
+      "numbers_str": "10-27-32-35-36-43",
+      "sum_value": 183,
+      "odd_count": 3,
+      "even_count": 3,
+      "score_sum": 0.86581,
+      "crowd_penalty": 0.0
+    },
+    {
+      "ticket_id": 5,
+      "numbers": [
+        3,
+        15,
+        16,
+        27,
+        38,
+        43
+      ],
+      "numbers_str": "03-15-16-27-38-43",
+      "sum_value": 142,
+      "odd_count": 4,
+      "even_count": 2,
+      "score_sum": 0.86404,
+      "crowd_penalty": 0.0
+    }
+  ],
+  "coverage_metrics": {
+    "cov_3_hits_ge_5th": 0.4364,
+    "cov_4_hits_ge_5th": 0.9253,
+    "cov_4_hits_ge_4th": 0.1515,
+    "cov_5_hits_ge_4th": 0.5619,
+    "avg_pairwise_overlap": 2.4
+  }
+}
