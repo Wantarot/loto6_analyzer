@@ -68,6 +68,7 @@ class PredictionConfig:
     bayes_prior_strength: float = 30.0
     bayes_num_prior_strength: float = 50.0
     bayes_num_baseline_weight: float = 0.35
+    bayes_recency_half_life: Optional[float] = 50.0  # per-set-ball exponential decay half-life (None/<=0 disables)
     manual_set_ball: Optional[str] = None
     top_k: int = DEFAULT_TOP_K
     val_draws: int = 100
@@ -245,9 +246,14 @@ def compute_bayesian_conditional_scores(
     prior_strength: float = 30.0,
     num_prior_strength: float = 50.0,
     num_baseline_weight: float = 0.35,
+    recency_half_life: Optional[float] = 50.0,
     already_validated: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Compute hierarchical Beta-Binomial posterior probabilities P_bayes(k | s).
+
+    When `recency_half_life` is positive, applies exponential recency decay per set ball
+    (half-life in draws of that set ball, and `10 * half_life` across overall history) so
+    recent physical ball conditions carry greater weight than decades-old draws.
 
     Returns:
         (mean_df, std_df): Both shaped (43, 10) with index 1..43 and columns A..J.
@@ -256,14 +262,23 @@ def compute_bayesian_conditional_scores(
     df = history_df if already_validated else validate_history_df(history_df)
     n_draws = len(df)
     n_sb = len(VALID_SET_BALLS)
+    use_decay = recency_half_life is not None and float(recency_half_life) > 0.0
+    hl = float(recency_half_life) if use_decay else 0.0
 
     appear_mat = np.zeros((n_draws, N_NUMBERS), dtype=np.float64)
     main_nums = df[MAIN_NUM_COLS].to_numpy(dtype=np.int32)
     appear_mat[np.repeat(np.arange(n_draws), N_MAIN_DRAW), (main_nums - 1).ravel()] = 1.0
 
     # Level 1: number-level overall posterior rate shrunk toward global mean 6/43
-    num_counts = appear_mat.sum(axis=0)
-    num_overall_post = (num_counts + num_prior_strength * GLOBAL_MEAN_RATE) / (n_draws + num_prior_strength)
+    if use_decay and n_draws > 0:
+        ages_all = np.arange(n_draws - 1, -1, -1, dtype=np.float64)
+        w_all = np.power(0.5, ages_all / (hl * float(n_sb)))
+        num_counts = (appear_mat * w_all[:, None]).sum(axis=0)
+        eff_draws = float(w_all.sum())
+    else:
+        num_counts = appear_mat.sum(axis=0)
+        eff_draws = float(n_draws)
+    num_overall_post = (num_counts + num_prior_strength * GLOBAL_MEAN_RATE) / (eff_draws + num_prior_strength)
     prior_p_per_num = (1.0 - num_baseline_weight) * GLOBAL_MEAN_RATE + num_baseline_weight * num_overall_post
 
     # Level 2: set-ball conditional Beta posterior per (number, set_ball)
@@ -272,8 +287,20 @@ def compute_bayesian_conditional_scores(
 
     for s_idx, sb in enumerate(VALID_SET_BALLS):
         mask = (df["set_ball"] == sb).to_numpy()
-        sb_draws = float(mask.sum())
-        sb_counts = appear_mat[mask].sum(axis=0) if sb_draws > 0 else np.zeros(N_NUMBERS, dtype=np.float64)
+        sb_sub = appear_mat[mask]
+        n_s = len(sb_sub)
+        if n_s > 0:
+            if use_decay:
+                ages_s = np.arange(n_s - 1, -1, -1, dtype=np.float64)
+                w_s = np.power(0.5, ages_s / hl)
+                sb_counts = (sb_sub * w_s[:, None]).sum(axis=0)
+                sb_draws = float(w_s.sum())
+            else:
+                sb_counts = sb_sub.sum(axis=0)
+                sb_draws = float(n_s)
+        else:
+            sb_counts = np.zeros(N_NUMBERS, dtype=np.float64)
+            sb_draws = 0.0
 
         alpha_post = sb_counts + prior_strength * prior_p_per_num
         beta_post = (sb_draws - sb_counts) + prior_strength * (1.0 - prior_p_per_num)
@@ -312,6 +339,7 @@ class Loto6PredictionEngine:
         self._lgbm_model: Optional[lgb.LGBMClassifier] = None
         self._lgbm_cond_df: Optional[pd.DataFrame] = None
         self._emp_sb_rates: Optional[np.ndarray] = None
+        self._emp_sb_rec50_rates: Optional[np.ndarray] = None
         self._next_base_feats: Optional[pd.DataFrame] = None
         self._model_metrics: dict[str, float] = {}
         self._feature_importance: pd.DataFrame = pd.DataFrame(columns=["feature", "importance"])
@@ -341,6 +369,8 @@ class Loto6PredictionEngine:
             prior_strength=cfg.bayes_prior_strength,
             num_prior_strength=cfg.bayes_num_prior_strength,
             num_baseline_weight=cfg.bayes_num_baseline_weight,
+            recency_half_life=cfg.bayes_recency_half_life,
+            already_validated=True,
         )
 
         # Stage 2B: Conditional LightGBM P(y_{t,k}=1 | set_ball_t=s, history_{<t})
@@ -456,6 +486,7 @@ class Loto6PredictionEngine:
         all_next_feats = build_next_draw_features_all_set_balls(filtered, already_validated=True)
         lgbm_cond_mat = np.empty((N_NUMBERS, len(VALID_SET_BALLS)), dtype=np.float64)
         emp_sb_rates = np.empty((N_NUMBERS, len(VALID_SET_BALLS)), dtype=np.float64)
+        emp_sb_rec50_rates = np.empty((N_NUMBERS, len(VALID_SET_BALLS)), dtype=np.float64)
         next_base_feats = all_next_feats[VALID_SET_BALLS[0]]
         for s_idx, sb in enumerate(VALID_SET_BALLS):
             next_feat_s = all_next_feats[sb]
@@ -463,6 +494,8 @@ class Loto6PredictionEngine:
             lgbm_cond_mat[:, s_idx] = _calibrate_probs_to_six(raw_probs)
             rates = next_feat_s["set_ball_appearance_rate"].to_numpy(dtype=np.float64)
             emp_sb_rates[:, s_idx] = np.where(np.isnan(rates), GLOBAL_MEAN_RATE, rates)
+            rec50 = next_feat_s["set_ball_recent_50_rate"].to_numpy(dtype=np.float64)
+            emp_sb_rec50_rates[:, s_idx] = np.where(np.isnan(rec50), GLOBAL_MEAN_RATE, rec50)
 
         self._lgbm_cond_df = pd.DataFrame(
             lgbm_cond_mat,
@@ -470,6 +503,7 @@ class Loto6PredictionEngine:
             columns=list(VALID_SET_BALLS),
         )
         self._emp_sb_rates = emp_sb_rates
+        self._emp_sb_rec50_rates = emp_sb_rec50_rates
         self._next_base_feats = next_base_feats
         return self
 
@@ -490,6 +524,7 @@ class Loto6PredictionEngine:
             or self._lgbm_cond_df is None
             or self._as_of_draw_no is None
             or self._emp_sb_rates is None
+            or self._emp_sb_rec50_rates is None
             or self._next_base_feats is None
         ):
             raise RuntimeError("predict_next() の前に fit() を実行してください。")
@@ -530,6 +565,7 @@ class Loto6PredictionEngine:
 
         next_base_feats = self._next_base_feats
         expected_sb_rate = self._emp_sb_rates @ sb_prob_vec
+        expected_sb_rec50_rate = self._emp_sb_rec50_rates @ sb_prob_vec
 
         scores_df = pd.DataFrame(
             {
@@ -539,13 +575,20 @@ class Loto6PredictionEngine:
                 "lgbm_score": lgbm_marg,
                 "score_lift": final_marg / GLOBAL_MEAN_RATE,
                 "expected_set_ball_rate": expected_sb_rate,
+                "expected_set_ball_rec50_rate": expected_sb_rec50_rate,
                 "overall_rate": next_base_feats["overall_appearance_rate"].to_numpy(dtype=np.float64),
                 "interval": next_base_feats["interval"].to_numpy(dtype=int),
                 "recent_5_count": next_base_feats["recent_5_count"].to_numpy(dtype=int),
                 "recent_10_count": next_base_feats["recent_10_count"].to_numpy(dtype=int),
+                "recent_24_count": next_base_feats["recent_24_count"].to_numpy(dtype=int),
                 "recent_30_count": next_base_feats["recent_30_count"].to_numpy(dtype=int),
                 "is_pull": next_base_feats["is_pull"].to_numpy(dtype=int),
+                "is_lag2_repeat": next_base_feats["is_lag2_repeat"].to_numpy(dtype=int),
                 "is_slide": next_base_feats["is_slide"].to_numpy(dtype=int),
+                "is_prev_consec_pull": next_base_feats["is_prev_consec_pull"].to_numpy(dtype=int),
+                "is_prev_consec_slide": next_base_feats["is_prev_consec_slide"].to_numpy(dtype=int),
+                "last_digit_gap": next_base_feats["last_digit_gap"].to_numpy(dtype=int),
+                "prev_decade_count": next_base_feats["prev_decade_count"].to_numpy(dtype=int),
             }
         )
         scores_df = scores_df.sort_values(

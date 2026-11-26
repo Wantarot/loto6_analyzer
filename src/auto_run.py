@@ -302,28 +302,43 @@ def generate_next_prediction_payload(
     start_draw_no: int = DEFAULT_START_DRAW_NO,
     min_past_draws: int = DEFAULT_MIN_PAST_DRAWS,
     lgbm_weight: float = 0.50,
+    bayes_recency_half_life: Optional[float] = 50.0,
     pool_size: int = 12,
     n_tickets: int = 5,
     use_crowd_penalty: bool = False,
+    sum_range: Optional[tuple[int, int]] = (80, 185),
+    max_per_decade: Optional[int] = 3,
+    max_number_usage: Optional[int] = 3,
+    require_same_last_digit: bool = True,
+    require_pull: bool = False,
+    require_slide: bool = False,
 ) -> dict[str, Any]:
     """Run Phase 2 + Phase 3 strictly on `history_df` and build JSON-serializable payload."""
+    latest_row = history_df.iloc[-1]
+    latest_nums = [int(latest_row[c]) for c in MAIN_NUM_COLS]
+
     pred_cfg = PredictionConfig(
         start_draw_no=start_draw_no,
         min_past_draws=min_past_draws,
         lgbm_weight=lgbm_weight,
+        bayes_recency_half_life=bayes_recency_half_life,
         top_k=pool_size,
     )
     opt_cfg = OptimizerConfig(
         pool_size=pool_size,
         n_tickets=n_tickets,
         use_crowd_penalty=use_crowd_penalty,
+        sum_range=sum_range,
+        max_per_decade=max_per_decade,
+        max_number_usage=max_number_usage,
+        require_same_last_digit=require_same_last_digit,
+        require_pull=require_pull,
+        require_slide=require_slide,
+        prev_numbers=tuple(latest_nums),
     )
 
     pred = Loto6PredictionEngine(pred_cfg).fit_predict_next(history_df)
     opt = optimize_tickets(pred.number_scores, opt_cfg)
-
-    latest_row = history_df.iloc[-1]
-    latest_nums = [int(latest_row[c]) for c in MAIN_NUM_COLS]
 
     sb_top3 = []
     for idx, r in enumerate(pred.set_ball_probs.head(3).itertuples(index=False), start=1):
@@ -348,8 +363,11 @@ def generate_next_prediction_payload(
                 "bayes_score": round(float(r.bayes_score), 5),
                 "lgbm_score": round(float(r.lgbm_score), 5),
                 "score_lift": round(float(r.score_lift), 4),
+                "expected_set_ball_rec50_rate": round(float(r.expected_set_ball_rec50_rate), 4),
+                "recent_24_count": int(r.recent_24_count),
                 "interval": int(r.interval),
                 "is_pull": int(r.is_pull),
+                "is_lag2_repeat": int(r.is_lag2_repeat),
                 "is_slide": int(r.is_slide),
             }
         )
@@ -365,6 +383,10 @@ def generate_next_prediction_payload(
                 "sum_value": int(r.sum_value),
                 "odd_count": int(r.odd_count),
                 "even_count": int(r.even_count),
+                "pull_count": int(r.pull_count),
+                "slide_count": int(r.slide_count),
+                "same_last_digit_str": str(r.same_last_digit_str),
+                "max_decade_count": int(r.max_decade_count),
                 "score_sum": round(float(r.score_sum), 5),
                 "crowd_penalty": round(float(r.crowd_penalty), 3),
             }
@@ -372,7 +394,7 @@ def generate_next_prediction_payload(
 
     cov = opt.coverage_metrics
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_jst": _now_jst_iso(),
         "target_draw_no": int(pred.target_draw_no),
         "as_of_draw_no": int(pred.as_of_draw_no),
@@ -390,9 +412,15 @@ def generate_next_prediction_payload(
             "start_draw_no": int(start_draw_no),
             "min_past_draws": int(min_past_draws),
             "lgbm_weight": float(lgbm_weight),
+            "bayes_recency_half_life": bayes_recency_half_life,
             "pool_size": int(pool_size),
             "n_tickets": int(n_tickets),
             "use_crowd_penalty": bool(use_crowd_penalty),
+            "max_per_decade": max_per_decade,
+            "max_number_usage": max_number_usage,
+            "require_same_last_digit": bool(require_same_last_digit),
+            "require_pull": bool(require_pull),
+            "require_slide": bool(require_slide),
         },
         "set_ball_top3": sb_top3,
         "pool_numbers": [int(x) for x in opt.pool_numbers],
@@ -497,13 +525,16 @@ def render_markdown_report(
             f"- プール内4個的中 → 5等以上カバー率: **{cov['cov_4_hits_ge_5th'] * 100:.1f}%** ｜ 3個的中 → 5等カバー率: **{cov['cov_3_hits_ge_5th'] * 100:.1f}%**",
             f"- 買い目間平均重複: `{cov['avg_pairwise_overlap']:.2f}個` ｜ 大衆心理ペナルティ: `{'ON' if cfg['use_crowd_penalty'] else 'OFF（的中率優先）'}`",
             "",
-            "| 口 | 推奨買い目 | 合計値 | 奇:偶 | スコア和 |",
-            "|---:|---|---:|:---:|---:|",
+            "| 口 | 推奨買い目 | 合計値 | 奇:偶 | 引/ス | 同尾数 | スコア和 |",
+            "|---:|---|---:|:---:|:---:|:---:|---:|",
         ]
     )
     for t in payload["tickets"]:
+        pull_c = t.get("pull_count", 0)
+        slide_c = t.get("slide_count", 0)
+        dup_tail = t.get("same_last_digit_str", "-")
         lines.append(
-            f"| **#{t['ticket_id']}** | `{t['numbers_str']}` | {t['sum_value']} | {t['odd_count']}:{t['even_count']} | {t['score_sum']:.4f} |"
+            f"| **#{t['ticket_id']}** | `{t['numbers_str']}` | {t['sum_value']} | {t['odd_count']}:{t['even_count']} | {pull_c}/{slide_c} | {dup_tail} | {t['score_sum']:.4f} |"
         )
 
     lines.append("")
@@ -586,9 +617,16 @@ def run_auto_pipeline(
     start_draw_no: int = DEFAULT_START_DRAW_NO,
     min_past_draws: int = DEFAULT_MIN_PAST_DRAWS,
     lgbm_weight: float = 0.50,
+    bayes_recency_half_life: Optional[float] = 50.0,
     pool_size: int = 12,
     n_tickets: int = 5,
     use_crowd_penalty: bool = False,
+    sum_range: Optional[tuple[int, int]] = (80, 185),
+    max_per_decade: Optional[int] = 3,
+    max_number_usage: Optional[int] = 3,
+    require_same_last_digit: bool = True,
+    require_pull: bool = False,
+    require_slide: bool = False,
 ) -> dict[str, Any]:
     """Execute the full automated pipeline and return summary metadata."""
     # 1. Fetch latest data
@@ -604,9 +642,16 @@ def run_auto_pipeline(
         start_draw_no=start_draw_no,
         min_past_draws=min_past_draws,
         lgbm_weight=lgbm_weight,
+        bayes_recency_half_life=bayes_recency_half_life,
         pool_size=pool_size,
         n_tickets=n_tickets,
         use_crowd_penalty=use_crowd_penalty,
+        sum_range=sum_range,
+        max_per_decade=max_per_decade,
+        max_number_usage=max_number_usage,
+        require_same_last_digit=require_same_last_digit,
+        require_pull=require_pull,
+        require_slide=require_slide,
     )
 
     # 4. Persist JSON & Markdown report

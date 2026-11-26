@@ -85,6 +85,7 @@ class BacktestConfig:
     min_past_draws: int = DEFAULT_MIN_PAST_DRAWS
     lgbm_weight: float = 0.50
     bayes_prior_strength: float = 30.0
+    bayes_recency_half_life: Optional[float] = 50.0
     pool_size: int = 12
     n_tickets: int = 5
     use_crowd_penalty: bool = False
@@ -92,6 +93,11 @@ class BacktestConfig:
     sum_range: Optional[tuple[int, int]] = (80, 185)
     odd_count_range: Optional[tuple[int, int]] = (1, 5)
     max_consecutive_run: Optional[int] = 4
+    max_per_decade: Optional[int] = 3
+    max_number_usage: Optional[int] = 3
+    require_same_last_digit: bool = True
+    require_pull: bool = False
+    require_slide: bool = False
     n_random_trials: int = 50
     random_state: int = 42
 
@@ -264,6 +270,7 @@ def _score_step_from_past(
         prior_strength=pred_cfg.bayes_prior_strength,
         num_prior_strength=pred_cfg.bayes_num_prior_strength,
         num_baseline_weight=pred_cfg.bayes_num_baseline_weight,
+        recency_half_life=pred_cfg.bayes_recency_half_life,
         already_validated=True,
     )
     bayes_mat = bayes_mean_df.to_numpy(dtype=np.float64)
@@ -346,17 +353,9 @@ def run_walk_forward_backtest(
         min_past_draws=cfg.min_past_draws,
         lgbm_weight=cfg.lgbm_weight,
         bayes_prior_strength=cfg.bayes_prior_strength,
+        bayes_recency_half_life=cfg.bayes_recency_half_life,
         top_k=cfg.pool_size,
         random_state=cfg.random_state,
-    )
-    opt_cfg = OptimizerConfig(
-        pool_size=cfg.pool_size,
-        n_tickets=cfg.n_tickets,
-        use_crowd_penalty=cfg.use_crowd_penalty,
-        crowd_penalty_weight=cfg.crowd_penalty_weight,
-        sum_range=cfg.sum_range,
-        odd_count_range=cfg.odd_count_range,
-        max_consecutive_run=cfg.max_consecutive_run,
     )
 
     rng = np.random.default_rng(cfg.random_state)
@@ -386,6 +385,22 @@ def run_walk_forward_backtest(
             recent_n_draws=cfg.recent_n_draws,
             as_of_draw_no=draw_no - 1,
             already_validated=True,
+        )
+        prev_main_tuple = tuple(int(past_df.iloc[-1][c]) for c in MAIN_NUM_COLS)
+        opt_cfg = OptimizerConfig(
+            pool_size=cfg.pool_size,
+            n_tickets=cfg.n_tickets,
+            use_crowd_penalty=cfg.use_crowd_penalty,
+            crowd_penalty_weight=cfg.crowd_penalty_weight,
+            sum_range=cfg.sum_range,
+            odd_count_range=cfg.odd_count_range,
+            max_consecutive_run=cfg.max_consecutive_run,
+            max_per_decade=cfg.max_per_decade,
+            max_number_usage=cfg.max_number_usage,
+            require_same_last_digit=cfg.require_same_last_digit,
+            require_pull=cfg.require_pull,
+            require_slide=cfg.require_slide,
+            prev_numbers=prev_main_tuple,
         )
 
         # Retrain LightGBM periodically on strictly past data

@@ -37,6 +37,7 @@ from src.backtest import (
 )
 from src.features import (
     GLOBAL_MEAN_RATE,
+    compute_previous_draw_profile,
     compute_set_ball_summary,
     verify_no_data_leakage,
 )
@@ -162,6 +163,7 @@ def _fit_engine_cached(
     recent_n_draws: Optional[int],
     min_past_draws: int,
     bayes_prior_strength: float,
+    bayes_recency_half_life: Optional[float],
 ) -> Loto6PredictionEngine:
     """Fit Bayesian + LightGBM engine once per (dataset, period, model hyperparams).
 
@@ -174,6 +176,7 @@ def _fit_engine_cached(
         recent_n_draws=recent_n_draws,
         min_past_draws=min_past_draws,
         bayes_prior_strength=bayes_prior_strength,
+        bayes_recency_half_life=bayes_recency_half_life,
     )
     return Loto6PredictionEngine(cfg).fit(history_df)
 
@@ -292,6 +295,17 @@ def render_sidebar() -> dict[str, object]:
                 step=5.0,
             )
         )
+        hl_val = int(
+            st.slider(
+                "ベイズ直近重視・半減期（セット球別回数 / 0=均等）",
+                min_value=0,
+                max_value=150,
+                value=50,
+                step=10,
+                help="50回で重みが半分になる指数減衰。最近の球の摩耗・コンディションを重視します（0で全期間均等）。",
+            )
+        )
+        bayes_recency_half_life: Optional[float] = float(hl_val) if hl_val > 0 else None
 
     st.sidebar.divider()
 
@@ -329,13 +343,24 @@ def render_sidebar() -> dict[str, object]:
             st.sidebar.slider("ペナルティ強度", min_value=0.05, max_value=0.80, value=0.25, step=0.05)
         )
 
-    with st.sidebar.expander("🎛️ 構造フィルタ（緩やか設定）", expanded=False):
-        use_sum_filter = st.checkbox("合計値フィルタを有効化", value=True)
-        sum_range = (
-            st.slider("合計値の範囲", min_value=21, max_value=243, value=(80, 185), step=5)
-            if use_sum_filter
-            else None
+    with st.sidebar.expander("🎛️ 構造フィルタ＆プロファイリング", expanded=False):
+        sum_preset = st.selectbox(
+            "合計値フィルタ・プリセット",
+            options=["標準 (80〜185)", "中心帯 (100〜165)", "狙い撃ち (120〜150)", "カスタム", "無効"],
+            index=0,
+            help="前回160以上などの反動狙い時は『中心帯』や『狙い撃ち (120〜150)』が便利です。",
         )
+        if sum_preset == "標準 (80〜185)":
+            sum_range: Optional[tuple[int, int]] = (80, 185)
+        elif sum_preset == "中心帯 (100〜165)":
+            sum_range = (100, 165)
+        elif sum_preset == "狙い撃ち (120〜150)":
+            sum_range = (120, 150)
+        elif sum_preset == "カスタム":
+            sum_range = st.slider("合計値の範囲", min_value=21, max_value=243, value=(120, 150), step=5)
+        else:
+            sum_range = None
+
         use_odd_filter = st.checkbox("奇数個数フィルタを有効化", value=True)
         odd_count_range = (
             st.slider("奇数個数の範囲", min_value=0, max_value=6, value=(1, 5), step=1)
@@ -344,6 +369,49 @@ def render_sidebar() -> dict[str, object]:
         )
         max_consecutive_run = int(
             st.slider("許容する最大連番長", min_value=2, max_value=6, value=4, step=1)
+        )
+        max_per_decade = int(
+            st.slider(
+                "同一番台の最大個数（番台偏重防止）",
+                min_value=2,
+                max_value=6,
+                value=3,
+                step=1,
+                help="1つの番台（例: 30番台）に偏りすぎるリスクを防ぎます（実測92.3%が3個以下）。",
+            )
+        )
+        max_usage_val = int(
+            st.slider(
+                "1数字の最大使用口数（軸集中防止 / 0=無制限）",
+                min_value=0,
+                max_value=10,
+                value=3,
+                step=1,
+                help="特定の1数字が全口に入りすぎてハズレ時に全滅するリスクを抑えます。",
+            )
+        )
+        max_number_usage: Optional[int] = max_usage_val if max_usage_val > 0 else None
+
+        require_same_last_digit = bool(
+            st.checkbox(
+                "同尾数ペアを必須にする（実測約80%）",
+                value=True,
+                help="ロト6の約8割で発生する『同じ下一桁の数字ペア』を各買い目に含めます。",
+            )
+        )
+        require_pull = bool(
+            st.checkbox(
+                "前回からの引っ張り（1個以上）を必須にする",
+                value=False,
+                help="前回本数字と同じ数字を各買い目に1個以上含めます（候補不足時は自動緩和）。",
+            )
+        )
+        require_slide = bool(
+            st.checkbox(
+                "前回±1スライド（1個以上）を必須にする",
+                value=False,
+                help="前回本数字の隣接（±1）数字を各買い目に1個以上含めます（候補不足時は自動緩和）。",
+            )
         )
 
     return {
@@ -354,6 +422,7 @@ def render_sidebar() -> dict[str, object]:
         "lgbm_weight": lgbm_weight,
         "min_past_draws": min_past_draws,
         "bayes_prior_strength": bayes_prior_strength,
+        "bayes_recency_half_life": bayes_recency_half_life,
         "pool_size": pool_size,
         "n_tickets": n_tickets,
         "use_crowd_penalty": use_crowd_penalty,
@@ -361,17 +430,23 @@ def render_sidebar() -> dict[str, object]:
         "sum_range": sum_range,
         "odd_count_range": odd_count_range,
         "max_consecutive_run": max_consecutive_run,
+        "max_per_decade": max_per_decade,
+        "max_number_usage": max_number_usage,
+        "require_same_last_digit": require_same_last_digit,
+        "require_pull": require_pull,
+        "require_slide": require_slide,
     }
 
 
 # ---------------------------------------------------------------------------
 # Tab 1: Next Draw Prediction & Optimized Wheeling Tickets
 # ---------------------------------------------------------------------------
-def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
+def render_tab_prediction(pred, opt, cfg: dict[str, object], profile: dict[str, object]) -> None:
     st.subheader(f"🔮 第{pred.target_draw_no}回 予測スコア＆最適買い目")
+    hl_txt = f"半減期 {int(cfg['bayes_recency_half_life'])}回" if cfg["bayes_recency_half_life"] else "均等重み"
     st.caption(
         f"学習・集計範囲：第{pred.train_start_draw}回 〜 第{pred.train_end_draw}回（{pred.n_history_draws:,}回分・完全リーク防止）"
-        f" ／ LightGBM重み: {pred.lgbm_weight:.2f} ／ "
+        f" ／ LightGBM重み: {pred.lgbm_weight:.2f} ／ ベイズ直近重視: {hl_txt} ／ "
         f"セット球モード: {'手動固定 (' + pred.manual_set_ball + ')' if pred.manual_set_ball else '自動確率周辺化'} ／ "
         f"大衆心理ペナルティ: {'ON' if cfg['use_crowd_penalty'] else 'OFF（的中率優先）'}"
     )
@@ -410,7 +485,7 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
     )
 
     if m.get("filters_relaxed", 0.0) > 0:
-        st.info("指定の構造フィルタを満たす組み合わせが不足したため、フィルタを自動緩和して最適買い目を生成しました。")
+        st.info("指定の構造・プロファイルフィルタを満たす組み合わせが不足したため、一部条件を自動緩和して最適買い目を生成しました。")
 
     col_cards, col_pool = st.columns([1.45, 1.0])
 
@@ -418,12 +493,16 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
         for row in opt.tickets_df.itertuples(index=False):
             nums = [int(row.num1), int(row.num2), int(row.num3), int(row.num4), int(row.num5), int(row.num6)]
             balls_html = _render_balls_html(nums, css_class="ball-ticket")
+            pull_c = int(getattr(row, "pull_count", 0))
+            slide_c = int(getattr(row, "slide_count", 0))
+            dup_t = str(getattr(row, "same_last_digit_str", "-"))
+            max_dec = int(getattr(row, "max_decade_count", 0))
             st.markdown(
                 f"""
                 <div class="ticket-card">
                   <div class="ticket-header">
                     <strong>買い目 #{int(row.ticket_id)}</strong>
-                    <span>合計: <b>{int(row.sum_value)}</b> ｜ 奇:偶 = <b>{int(row.odd_count)}:{int(row.even_count)}</b> ｜ スコア和: <b>{row.score_sum:.4f}</b> ｜ 大衆度: {row.crowd_penalty:.2f}</span>
+                    <span>合計: <b>{int(row.sum_value)}</b> ｜ 奇:偶 = <b>{int(row.odd_count)}:{int(row.even_count)}</b> ｜ 引/ス: <b>{pull_c}/{slide_c}</b> ｜ 同尾: <b>{dup_t}</b> ｜ 同番台最大: {max_dec} ｜ スコア和: <b>{row.score_sum:.4f}</b></span>
                   </div>
                   <div>{balls_html}</div>
                 </div>
@@ -432,7 +511,7 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
             )
 
         copy_text = "\n".join(
-            f"口{int(r.ticket_id)}: {r.numbers_str} (合計={int(r.sum_value)}, 奇偶={int(r.odd_count)}:{int(r.even_count)})"
+            f"口{int(r.ticket_id)}: {r.numbers_str} (合計={int(r.sum_value)}, 奇偶={int(r.odd_count)}:{int(r.even_count)}, 引/ス={int(getattr(r, 'pull_count', 0))}/{int(getattr(r, 'slide_count', 0))}, 同尾={getattr(r, 'same_last_digit_str', '-')})"
             for r in opt.tickets_df.itertuples(index=False)
         )
         with st.expander("📋 コピー用テキスト ＆ CSVダウンロード"):
@@ -470,6 +549,44 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
         fig_usage.update_layout(height=280, margin=dict(l=10, r=10, t=42, b=10), coloraxis_showscale=False)
         fig_usage.update_traces(textposition="outside")
         st.plotly_chart(fig_usage, **_STRETCH_KW)
+
+    # --- Section A2: Previous Draw Profiling Diagnostic ---
+    with st.expander(f"🕵️ 前回（第{profile['draw_no']}回）プロファイリング要約（スライド・下一桁・過去24回・合計値目安）", expanded=False):
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("前回合計値", f"{profile['sum_value']}", delta=f"奇:偶 = {profile['odd_count']}:{profile['even_count']}", delta_color="off")
+        p2.metric(
+            f"{profile['cond_zone_label']}の次回平均",
+            f"{profile['cond_next_sum_mean']:.1f}",
+            delta=f"標本 {profile['cond_sample_n']}回",
+            delta_color="off",
+        )
+        p3.metric("次回 120〜150 収束率", f"{profile['cond_next_120_150_pct']:.1f}%")
+        p4.metric("次回 100〜165 収束率", f"{profile['cond_next_100_165_pct']:.1f}%")
+
+        consec_pairs = profile["consecutive_pairs"]
+        consec_txt = ", ".join(f"{a:02d}-{b:02d}" for a, b in consec_pairs) if consec_pairs else "なし"
+        slide_txt = " ".join(f"{n:02d}" for n in profile["slide_candidates"])
+        lag2_txt = " ".join(f"{n:02d}" for n in profile["lag2_numbers"]) if profile["lag2_numbers"] else "-"
+        dec_txt = " / ".join(f"{k}: {v}個" for k, v in profile["decade_counts"].items())
+        dup_txt = ", ".join(str(d) for d in profile["prev_dup_tails"]) if profile["prev_dup_tails"] else "なし（全バラ）"
+
+        st.markdown(
+            f"- **前回連番**: `{consec_txt}` ｜ **前回同尾数**: `{dup_txt}` ｜ **番台配分**: `{dec_txt}`\n"
+            f"- **スライド候補（前回±1）**: `{slide_txt}`\n"
+            f"- **隔回復活候補（2回前本数字）**: `{lag2_txt}`"
+        )
+
+        tail_df = pd.DataFrame(
+            {
+                f"末尾{d}": [
+                    int(profile["tail_24_counts"][d]),
+                    int(profile["tail_gaps"][d]),
+                ]
+                for d in range(10)
+            },
+            index=["過去24回出現", "連続未出現"],
+        )
+        st.dataframe(tail_df, **_STRETCH_KW)
 
     st.divider()
 
@@ -528,9 +645,11 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
             "bayes_score": ":.4f",
             "lgbm_score": ":.4f",
             "score_lift": ":.3f",
+            "recent_24_count": True,
             "interval": True,
             "is_pull": True,
             "is_slide": True,
+            "is_lag2_repeat": True,
         },
         title="全43数字の次回出現予測スコア（破線=理論平均 6/43 ≈ 0.1395）",
         labels={"number": "数字 (1〜43)", "final_score": "統合スコア"},
@@ -553,13 +672,14 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
             "bayes_score",
             "lgbm_score",
             "score_lift",
+            "expected_set_ball_rec50_rate",
             "expected_set_ball_rate",
+            "recent_24_count",
             "interval",
-            "recent_5_count",
-            "recent_10_count",
-            "recent_30_count",
             "is_pull",
+            "is_lag2_repeat",
             "is_slide",
+            "last_digit_gap",
         ]
     ].copy()
     disp_scores.columns = [
@@ -569,13 +689,14 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
         "ベイズ",
         "LGBM",
         "理論比(倍)",
-        "期待セット球率",
+        "直近50回SB率",
+        "全期間SB率",
+        "過去24回",
         "未出現間隔",
-        "直近5回",
-        "直近10回",
-        "直近30回",
         "引っ張り",
+        "隔回(2前)",
         "スライド",
+        "末尾未出現",
     ]
     st.dataframe(
         disp_scores.style.format(
@@ -584,7 +705,8 @@ def render_tab_prediction(pred, opt, cfg: dict[str, object]) -> None:
                 "ベイズ": "{:.4f}",
                 "LGBM": "{:.4f}",
                 "理論比(倍)": "{:.3f}",
-                "期待セット球率": "{:.3%}",
+                "直近50回SB率": "{:.2%}",
+                "全期間SB率": "{:.2%}",
             }
         ),
         **_STRETCH_KW,
@@ -797,6 +919,7 @@ def render_tab_backtest(history_df: pd.DataFrame, cfg: dict[str, object]) -> Non
             min_past_draws=int(cfg["min_past_draws"]),
             lgbm_weight=float(cfg["lgbm_weight"]),
             bayes_prior_strength=float(cfg["bayes_prior_strength"]),
+            bayes_recency_half_life=cfg["bayes_recency_half_life"],
             pool_size=int(cfg["pool_size"]),
             n_tickets=int(cfg["n_tickets"]),
             use_crowd_penalty=bool(cfg["use_crowd_penalty"]),
@@ -804,6 +927,11 @@ def render_tab_backtest(history_df: pd.DataFrame, cfg: dict[str, object]) -> Non
             sum_range=cfg["sum_range"],
             odd_count_range=cfg["odd_count_range"],
             max_consecutive_run=int(cfg["max_consecutive_run"]),
+            max_per_decade=int(cfg["max_per_decade"]),
+            max_number_usage=cfg["max_number_usage"],
+            require_same_last_digit=bool(cfg["require_same_last_digit"]),
+            require_pull=bool(cfg["require_pull"]),
+            require_slide=bool(cfg["require_slide"]),
             n_random_trials=n_random_trials,
         )
         progress_bar = st.progress(0, text="ウォークフォワード検証を準備中...")
@@ -846,6 +974,7 @@ def render_tab_backtest(history_df: pd.DataFrame, cfg: dict[str, object]) -> Non
                         start_draw_no=cfg["start_draw_no"],
                         recent_n_draws=cfg["recent_n_draws"],
                         min_past_draws=int(cfg["min_past_draws"]),
+                        bayes_recency_half_life=cfg["bayes_recency_half_life"],
                     ),
                 )
             st.success(
@@ -1124,9 +1253,16 @@ def render_tab_live_performance(cfg: dict[str, object]) -> None:
                         start_draw_no=int(cfg["start_draw_no"] or DEFAULT_START_DRAW_NO),
                         min_past_draws=int(cfg["min_past_draws"]),
                         lgbm_weight=float(cfg["lgbm_weight"]),
+                        bayes_recency_half_life=cfg["bayes_recency_half_life"],
                         pool_size=int(cfg["pool_size"]),
                         n_tickets=int(cfg["n_tickets"]),
                         use_crowd_penalty=bool(cfg["use_crowd_penalty"]),
+                        sum_range=cfg["sum_range"],
+                        max_per_decade=int(cfg["max_per_decade"]),
+                        max_number_usage=cfg["max_number_usage"],
+                        require_same_last_digit=bool(cfg["require_same_last_digit"]),
+                        require_pull=bool(cfg["require_pull"]),
+                        require_slide=bool(cfg["require_slide"]),
                     )
                     _clear_all_caches()
                     eval_msg = "前回予測の照合結果を追記しました。" if res["evaluated"] else "照合待ちの開催回はまだ未抽選でした。"
@@ -1390,6 +1526,7 @@ def main() -> None:
                 recent_n_draws=cfg["recent_n_draws"],
                 min_past_draws=int(cfg["min_past_draws"]),
                 bayes_prior_strength=float(cfg["bayes_prior_strength"]),
+                bayes_recency_half_life=cfg["bayes_recency_half_life"],
             )
             pred = engine.predict_next(
                 manual_set_ball=cfg["manual_set_ball"],
@@ -1406,6 +1543,12 @@ def main() -> None:
                     sum_range=cfg["sum_range"],
                     odd_count_range=cfg["odd_count_range"],
                     max_consecutive_run=int(cfg["max_consecutive_run"]),
+                    max_per_decade=int(cfg["max_per_decade"]),
+                    max_number_usage=cfg["max_number_usage"],
+                    require_same_last_digit=bool(cfg["require_same_last_digit"]),
+                    require_pull=bool(cfg["require_pull"]),
+                    require_slide=bool(cfg["require_slide"]),
+                    prev_numbers=tuple(latest_nums),
                 ),
             )
             filtered_df = filter_history_period(
@@ -1414,6 +1557,7 @@ def main() -> None:
                 recent_n_draws=cfg["recent_n_draws"],
                 already_validated=True,
             )
+            prev_profile = compute_previous_draw_profile(filtered_df, already_validated=True)
     except Exception as exc:
         st.error(f"予測または最適化の実行中にエラーが発生しました: {exc}")
         return
@@ -1430,7 +1574,7 @@ def main() -> None:
     )
 
     with tab1:
-        render_tab_prediction(pred, opt, cfg)
+        render_tab_prediction(pred, opt, cfg, prev_profile)
     with tab2:
         render_tab_eda(filtered_df, pred, cfg)
     with tab3:

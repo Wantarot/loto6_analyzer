@@ -43,6 +43,13 @@ class OptimizerConfig:
     sum_range: Optional[tuple[int, int]] = (80, 185)
     odd_count_range: Optional[tuple[int, int]] = (1, 5)
     max_consecutive_run: Optional[int] = 4
+    # PDCA profiling & risk-dispersion constraints
+    max_per_decade: Optional[int] = 3  # Cap numbers in any single decade (01-09..40-43)
+    max_number_usage: Optional[int] = 3  # Cap how many tickets may share the same single number
+    require_same_last_digit: bool = True  # Require at least one same-last-digit pair (~80% empirical rate)
+    require_pull: bool = False  # Require >=1 number repeated from previous draw
+    require_slide: bool = False  # Require >=1 number adjacent (±1) to previous draw
+    prev_numbers: Optional[tuple[int, ...]] = None  # Previous draw main numbers (for pull/slide)
     # Coverage optimization weights
     cov_4_for_3_weight: float = 0.45  # 4 hits in pool -> >=5th prize (3+ matches)
     cov_3_for_3_weight: float = 0.25  # 3 hits in pool -> >=5th prize (3 matches)
@@ -154,8 +161,22 @@ def _subset_weights(
     return w / w.sum()
 
 
-def _passes_filters(ticket: Sequence[int], cfg: OptimizerConfig) -> bool:
-    """Check whether a 6-number ticket satisfies the configured gentle structural filters."""
+def _max_decade_count(ticket: Sequence[int]) -> int:
+    """Return the maximum number of digits sharing the same decade (01-09..40-43)."""
+    counts = [0, 0, 0, 0, 0]
+    for x in ticket:
+        counts[int(x) // 10] += 1
+    return max(counts)
+
+
+def _same_last_digits(ticket: Sequence[int]) -> list[int]:
+    """Return sorted last digits (0..9) appearing at least twice in `ticket`."""
+    tails = [int(x) % 10 for x in ticket]
+    return sorted({d for d in tails if tails.count(d) >= 2})
+
+
+def _passes_base_filters(ticket: Sequence[int], cfg: OptimizerConfig) -> bool:
+    """Check whether a 6-number ticket satisfies base structural filters."""
     if cfg.sum_range is not None:
         s = sum(ticket)
         if not (cfg.sum_range[0] <= s <= cfg.sum_range[1]):
@@ -168,6 +189,41 @@ def _passes_filters(ticket: Sequence[int], cfg: OptimizerConfig) -> bool:
         if _max_consecutive_run(ticket) > cfg.max_consecutive_run:
             return False
     return True
+
+
+def _passes_profile_filters(
+    ticket: Sequence[int],
+    cfg: OptimizerConfig,
+    prev_set: set[int],
+    slide_set: set[int],
+) -> bool:
+    """Check whether a 6-number ticket satisfies PDCA profiling filters."""
+    if cfg.max_per_decade is not None:
+        if _max_decade_count(ticket) > cfg.max_per_decade:
+            return False
+    if cfg.require_same_last_digit:
+        if not _same_last_digits(ticket):
+            return False
+    t_set = set(ticket)
+    if cfg.require_pull and prev_set:
+        if not (t_set & prev_set):
+            return False
+    if cfg.require_slide and slide_set:
+        if not (t_set & slide_set):
+            return False
+    return True
+
+
+def _passes_filters(
+    ticket: Sequence[int],
+    cfg: OptimizerConfig,
+    prev_set: Optional[set[int]] = None,
+    slide_set: Optional[set[int]] = None,
+) -> bool:
+    """Check whether a 6-number ticket satisfies both base and profiling filters."""
+    return _passes_base_filters(ticket, cfg) and _passes_profile_filters(
+        ticket, cfg, prev_set or set(), slide_set or set()
+    )
 
 
 def evaluate_portfolio_coverage(
@@ -287,6 +343,22 @@ def optimize_tickets(
 
     m = len(pool_numbers)
 
+    # Resolve previous-draw numbers & slide candidates (from cfg.prev_numbers or number_scores_df flags)
+    if cfg.prev_numbers is not None:
+        prev_set = {int(x) for x in cfg.prev_numbers}
+        slide_set = {x + d for x in prev_set for d in (-1, 1) if 1 <= x + d <= 43} - prev_set
+    else:
+        if "is_pull" in number_scores_df.columns:
+            prev_set = set(number_scores_df.loc[number_scores_df["is_pull"] == 1, "number"].astype(int).tolist())
+        else:
+            prev_set = set()
+        if "is_slide" in number_scores_df.columns:
+            slide_set = set(number_scores_df.loc[number_scores_df["is_slide"] == 1, "number"].astype(int).tolist()) - prev_set
+        elif prev_set:
+            slide_set = {x + d for x in prev_set for d in (-1, 1) if 1 <= x + d <= 43} - prev_set
+        else:
+            slide_set = set()
+
     # Generate candidate 6-number tickets from the top M pool (index representation 0..m-1)
     all_idx_combos = list(itertools.combinations(range(m), 6))
     if len(all_idx_combos) < cfg.n_tickets:
@@ -295,20 +367,35 @@ def optimize_tickets(
             f"n_tickets={cfg.n_tickets} より少ないです。"
         )
 
-    filtered_idx_combos = [
-        idx_c for idx_c in all_idx_combos if _passes_filters(sorted(pool_numbers[i] for i in idx_c), cfg)
+    # Two-stage filtering: (1) base + profiling filters -> (2) base filters only -> (3) unfiltered
+    base_idx_combos = [
+        idx_c for idx_c in all_idx_combos if _passes_base_filters(sorted(pool_numbers[i] for i in idx_c), cfg)
     ]
+    strict_idx_combos = [
+        idx_c
+        for idx_c in base_idx_combos
+        if _passes_profile_filters(sorted(pool_numbers[i] for i in idx_c), cfg, prev_set, slide_set)
+    ]
+
     filters_relaxed = False
-    if len(filtered_idx_combos) < cfg.n_tickets:
+    if len(strict_idx_combos) >= cfg.n_tickets:
+        cand_idx_combos = strict_idx_combos
+    elif len(base_idx_combos) >= cfg.n_tickets:
+        logger.warning(
+            "プロファイル制約後の候補数 (%d) が n_tickets (%d) 未満のため基本フィルタのみへ緩和します。",
+            len(strict_idx_combos),
+            cfg.n_tickets,
+        )
+        cand_idx_combos = base_idx_combos
+        filters_relaxed = True
+    else:
         logger.warning(
             "構造フィルタ後の候補数 (%d) が n_tickets (%d) 未満のためフィルタを自動緩和します。",
-            len(filtered_idx_combos),
+            len(base_idx_combos),
             cfg.n_tickets,
         )
         cand_idx_combos = all_idx_combos
         filters_relaxed = True
-    else:
-        cand_idx_combos = filtered_idx_combos
 
     n_cand = len(cand_idx_combos)
     cand_arr = np.array(cand_idx_combos, dtype=np.int32)  # (n_cand, 6)
@@ -351,8 +438,14 @@ def optimize_tickets(
     if cfg.use_crowd_penalty:
         intrinsic = intrinsic - (cfg.crowd_penalty_weight / cfg.n_tickets) * crowd_penalties
 
-    # Precompute overlap penalty scaling denominator
+    # Precompute overlap penalty scaling denominator & feasible per-number usage cap
     max_pairs = max(1, cfg.n_tickets * (cfg.n_tickets - 1) // 2)
+    min_feasible_usage = (6 * cfg.n_tickets + m - 1) // m
+    effective_usage_cap = (
+        max(int(cfg.max_number_usage), min_feasible_usage)
+        if cfg.max_number_usage is not None and cfg.max_number_usage > 0
+        else None
+    )
 
     def _candidate_marginal_values(
         cur_selected: list[int],
@@ -363,6 +456,7 @@ def optimize_tickets(
             uncov4_3 = np.ones(len(subs4), dtype=bool)
             uncov4_4 = np.ones(len(subs4), dtype=bool)
             overlap_pen = np.zeros(n_cand, dtype=np.float64)
+            usage_pen = np.zeros(n_cand, dtype=np.float64)
         else:
             sel = np.array(cur_selected, dtype=np.int32)
             uncov3 = ~cov3_mat[sel].any(axis=0)
@@ -373,6 +467,14 @@ def optimize_tickets(
             # Soft penalty on squared overlap above 2 numbers
             excess = np.maximum(0.0, ov - 2.0) ** 2 / 16.0
             overlap_pen = (cfg.overlap_penalty_weight / max_pairs) * excess.sum(axis=1)
+            if effective_usage_cap is not None:
+                cur_usage = cand_bin[sel].sum(axis=0, dtype=np.int32)
+                over_usage = np.maximum(
+                    0, (cand_bin.astype(np.int32) + cur_usage[None, :]) - int(effective_usage_cap)
+                ).sum(axis=1)
+                usage_pen = 10.0 * over_usage.astype(np.float64)
+            else:
+                usage_pen = np.zeros(n_cand, dtype=np.float64)
 
         gain_4_3 = cov4_ge3_mat[:, uncov4_3] @ w4[uncov4_3] if uncov4_3.any() else 0.0
         gain_3_3 = cov3_mat[:, uncov3] @ w3[uncov3] if uncov3.any() else 0.0
@@ -384,6 +486,7 @@ def optimize_tickets(
             + cfg.cov_4_for_4_weight * gain_4_4
             + intrinsic
             - overlap_pen
+            - usage_pen
         )
         if cur_selected:
             values[cur_selected] = -1e9  # prevent duplicate tickets
@@ -417,6 +520,8 @@ def optimize_tickets(
         nums = tuple(sorted(pool_numbers[i] for i in cand_idx_combos[c_idx]))
         tickets.append(nums)
         n_odd = sum(1 for x in nums if x % 2 == 1)
+        t_set = set(nums)
+        dup_tails = _same_last_digits(nums)
         ticket_rows.append(
             {
                 "ticket_id": t_idx,
@@ -431,6 +536,10 @@ def optimize_tickets(
                 "odd_count": int(n_odd),
                 "even_count": int(6 - n_odd),
                 "max_consecutive": int(_max_consecutive_run(nums)),
+                "max_decade_count": int(_max_decade_count(nums)),
+                "pull_count": int(len(t_set & prev_set)) if prev_set else 0,
+                "slide_count": int(len(t_set & slide_set)) if slide_set else 0,
+                "same_last_digit_str": ",".join(str(d) for d in dup_tails) if dup_tails else "なし",
                 "score_sum": float(sum(score_map[x] for x in nums)),
                 "crowd_penalty": float(crowd_penalties[c_idx]),
             }

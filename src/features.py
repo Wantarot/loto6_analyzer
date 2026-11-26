@@ -36,23 +36,48 @@ GLOBAL_MEAN_RATE = N_MAIN_DRAW / N_NUMBERS  # 6 / 43 ≈ 0.139535
 SET_BALL_TO_IDX = {sb: idx for idx, sb in enumerate(VALID_SET_BALLS)}
 N_SET_BALLS = len(VALID_SET_BALLS)
 
-RECENT_WINDOWS = (5, 10, 30)
+RECENT_WINDOWS = (5, 10, 24, 30)
+SET_BALL_RECENT_WINDOWS = (30, 50)
+
+_NUMBERS_1_TO_43 = np.arange(NUM_MIN, NUM_MAX + 1, dtype=np.int32)
+_LAST_DIGITS = _NUMBERS_1_TO_43 % 10
+_DECADES = _NUMBERS_1_TO_43 // 10  # 0:1..9, 1:10..19, 2:20..29, 3:30..39, 4:40..43
+_LAST_DIGIT_COUNTS = np.array([(int((_LAST_DIGITS == d).sum())) for d in range(10)], dtype=np.float64)
 
 FEATURE_COLS = [
     "overall_appearance_rate",
     "set_ball_past_draws",
     "set_ball_appearance_rate",
+    "set_ball_recent_30_rate",
+    "set_ball_recent_50_rate",
     "set_ball_rate_diff",
     "set_ball_rate_diff_vs_num_avg",
     "interval",
     "recent_5_count",
     "recent_10_count",
+    "recent_24_count",
     "recent_30_count",
     "is_pull",
+    "is_lag2_repeat",
     "is_slide",
     "is_slide_minus1",
     "is_slide_plus1",
+    "is_prev_consec_pull",
+    "is_prev_consec_slide",
+    "last_digit_recent_24_rate",
+    "last_digit_gap",
+    "prev_decade_count",
 ]
+
+FLOAT_FEATURE_COLS = {
+    "overall_appearance_rate",
+    "set_ball_appearance_rate",
+    "set_ball_recent_30_rate",
+    "set_ball_recent_50_rate",
+    "set_ball_rate_diff",
+    "set_ball_rate_diff_vs_num_avg",
+    "last_digit_recent_24_rate",
+}
 
 SetBallMode = Literal["prev", "fixed", "actual"]
 
@@ -71,17 +96,20 @@ def _build_appearance_matrix(df: pd.DataFrame) -> np.ndarray:
 def _compute_prefix_states(
     appear_mat: np.ndarray,
     set_ball_indices: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
     """Compute strictly-before-i cumulative states for indices i = 0..T.
 
     Index i represents the state AFTER draws 0..(i-1) and strictly BEFORE draw i.
     Index T represents the state after ALL T historical draws (for predicting draw T+1).
 
     Returns:
-        cum_all:       (T+1, 43) cumulative appearances across all set balls before i
-        cum_sb_appear: (T+1, 10, 43) cumulative appearances per set ball before i
-        cum_sb_draws:  (T+1, 10) cumulative draw counts per set ball before i
-        intervals:     (T+1, 43) consecutive miss counts strictly before i
+        cum_all:        (T+1, 43) cumulative appearances across all set balls before i
+        cum_sb_appear:  (T+1, 10, 43) cumulative appearances per set ball before i
+        cum_sb_draws:   (T+1, 10) cumulative draw counts per set ball before i
+        intervals:      (T+1, 43) consecutive miss counts strictly before i
+        sb_seq_cum:     list of 10 arrays, each (n_s + 1, 43) cumulative appearances
+                        indexed by that set ball's own occurrence sequence (for O(1) recent W)
+        tail_intervals: (T+1, 10) consecutive miss counts for each last digit 0..9 before i
     """
     n_draws = appear_mat.shape[0]
 
@@ -99,17 +127,31 @@ def _compute_prefix_states(
         cum_sb_appear[t + 1, sb_idx] += appear_mat[t]
         cum_sb_draws[t + 1, sb_idx] += 1
 
-    # Consecutive miss intervals strictly before draw i:
-    # Recorded BEFORE observing appear_mat[i].
+    # Per-set-ball sequence prefix sums for O(1) recent-W window rates
+    sb_seq_cum: list[np.ndarray] = []
+    for s in range(N_SET_BALLS):
+        sub = appear_mat[set_ball_indices == s]
+        seq_c = np.zeros((len(sub) + 1, N_NUMBERS), dtype=np.int32)
+        if len(sub) > 0:
+            seq_c[1:] = np.cumsum(sub, axis=0, dtype=np.int32)
+        sb_seq_cum.append(seq_c)
+
+    # Consecutive miss intervals strictly before draw i (per number & per last digit 0..9)
     intervals = np.zeros((n_draws + 1, N_NUMBERS), dtype=np.int32)
+    tail_intervals = np.zeros((n_draws + 1, 10), dtype=np.int32)
     cur_interval = np.zeros(N_NUMBERS, dtype=np.int32)
+    cur_tail_interval = np.zeros(10, dtype=np.int32)
     for t in range(n_draws):
         intervals[t] = cur_interval
+        tail_intervals[t] = cur_tail_interval
         appeared = appear_mat[t] == 1
         cur_interval = np.where(appeared, 0, cur_interval + 1)
+        tail_appeared = np.array([bool(appeared[_LAST_DIGITS == d].any()) for d in range(10)])
+        cur_tail_interval = np.where(tail_appeared, 0, cur_tail_interval + 1)
     intervals[n_draws] = cur_interval
+    tail_intervals[n_draws] = cur_tail_interval
 
-    return cum_all, cum_sb_appear, cum_sb_draws, intervals
+    return cum_all, cum_sb_appear, cum_sb_draws, intervals, sb_seq_cum, tail_intervals
 
 
 def _resolve_ref_set_balls(
@@ -143,6 +185,8 @@ def _extract_features_for_step(
     cum_sb_appear: np.ndarray,
     cum_sb_draws: np.ndarray,
     intervals: np.ndarray,
+    sb_seq_cum: list[np.ndarray],
+    tail_intervals: np.ndarray,
     ref_set_ball: Optional[str],
 ) -> dict[str, np.ndarray]:
     """Extract all 43-element leak-free feature arrays for a single step index `step_idx`."""
@@ -152,7 +196,7 @@ def _extract_features_for_step(
     else:
         overall_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
 
-    # 2. Set-ball-specific appearance rate & deviations (strictly from draws 0 .. step_idx-1)
+    # 2. Set-ball-specific appearance rates (all-time + recent 30/50 of that set ball)
     if ref_set_ball is not None:
         sb_idx = SET_BALL_TO_IDX[ref_set_ball]
         sb_draws = int(cum_sb_draws[step_idx, sb_idx])
@@ -160,25 +204,35 @@ def _extract_features_for_step(
             sb_rate = cum_sb_appear[step_idx, sb_idx].astype(np.float64) / float(sb_draws)
             sb_diff_global = sb_rate - GLOBAL_MEAN_RATE
             sb_diff_vs_num = sb_rate - overall_rate
+            seq_c = sb_seq_cum[sb_idx]
+            w30 = min(sb_draws, 30)
+            w50 = min(sb_draws, 50)
+            sb_rec30_rate = (seq_c[sb_draws] - seq_c[sb_draws - w30]).astype(np.float64) / float(w30)
+            sb_rec50_rate = (seq_c[sb_draws] - seq_c[sb_draws - w50]).astype(np.float64) / float(w50)
         else:
             sb_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
+            sb_rec30_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
+            sb_rec50_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
             sb_diff_global = np.full(N_NUMBERS, np.nan, dtype=np.float64)
             sb_diff_vs_num = np.full(N_NUMBERS, np.nan, dtype=np.float64)
     else:
         sb_draws = 0
         sb_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
+        sb_rec30_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
+        sb_rec50_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
         sb_diff_global = np.full(N_NUMBERS, np.nan, dtype=np.float64)
         sb_diff_vs_num = np.full(N_NUMBERS, np.nan, dtype=np.float64)
 
     # 3. Interval (consecutive misses strictly before step_idx)
     interval_vec = intervals[step_idx]
 
-    # 4. Recent 5 / 10 / 30 draw appearance counts (draws max(0, step_idx-w) .. step_idx-1)
+    # 4. Recent 5 / 10 / 24 / 30 draw appearance counts (draws max(0, step_idx-w) .. step_idx-1)
     recent_5 = cum_all[step_idx] - cum_all[max(0, step_idx - 5)]
     recent_10 = cum_all[step_idx] - cum_all[max(0, step_idx - 10)]
+    recent_24 = cum_all[step_idx] - cum_all[max(0, step_idx - 24)]
     recent_30 = cum_all[step_idx] - cum_all[max(0, step_idx - 30)]
 
-    # 5. Pull (引っ張り) and Slide (±1) flags relative to draw step_idx-1
+    # 5. Pull (引っ張り), Lag-2 Repeat (隔回復活), Slide (±1), and Prev-Consecutive signals
     if step_idx > 0:
         prev = appear_mat[step_idx - 1]
         is_pull = prev.copy()
@@ -187,26 +241,71 @@ def _extract_features_for_step(
         is_slide_minus1[1:] = prev[:-1]  # number k has k-1 in previous draw
         is_slide_plus1[:-1] = prev[1:]   # number k has k+1 in previous draw
         is_slide = np.maximum(is_slide_minus1, is_slide_plus1)
+
+        # Previous draw consecutive pair membership & adjacent slides
+        has_left_adj = np.zeros(N_NUMBERS, dtype=np.int32)
+        has_right_adj = np.zeros(N_NUMBERS, dtype=np.int32)
+        has_left_adj[1:] = prev[:-1]
+        has_right_adj[:-1] = prev[1:]
+        in_prev_consec = (prev == 1) & ((has_left_adj == 1) | (has_right_adj == 1))
+        is_prev_consec_pull = in_prev_consec.astype(np.int32)
+
+        consec_left = np.zeros(N_NUMBERS, dtype=bool)
+        consec_right = np.zeros(N_NUMBERS, dtype=bool)
+        consec_left[1:] = in_prev_consec[:-1]
+        consec_right[:-1] = in_prev_consec[1:]
+        is_prev_consec_slide = ((prev == 0) & (consec_left | consec_right)).astype(np.int32)
+
+        # Previous draw decade density for each number's decade
+        dec_counts = np.bincount(_DECADES, weights=prev, minlength=5).astype(np.int32)
+        prev_decade_count = dec_counts[_DECADES]
     else:
         is_pull = np.zeros(N_NUMBERS, dtype=np.int32)
         is_slide_minus1 = np.zeros(N_NUMBERS, dtype=np.int32)
         is_slide_plus1 = np.zeros(N_NUMBERS, dtype=np.int32)
         is_slide = np.zeros(N_NUMBERS, dtype=np.int32)
+        is_prev_consec_pull = np.zeros(N_NUMBERS, dtype=np.int32)
+        is_prev_consec_slide = np.zeros(N_NUMBERS, dtype=np.int32)
+        prev_decade_count = np.zeros(N_NUMBERS, dtype=np.int32)
+
+    if step_idx >= 2:
+        is_lag2_repeat = appear_mat[step_idx - 2].copy()
+    else:
+        is_lag2_repeat = np.zeros(N_NUMBERS, dtype=np.int32)
+
+    # 6. Last-digit (下一桁) recent-24 normalized rate & consecutive miss gap
+    w24 = min(step_idx, 24)
+    if w24 > 0:
+        tail_sums = np.bincount(_LAST_DIGITS, weights=recent_24, minlength=10)
+        tail_rates = tail_sums / (_LAST_DIGIT_COUNTS * float(w24))
+        last_digit_recent_24_rate = tail_rates[_LAST_DIGITS]
+    else:
+        last_digit_recent_24_rate = np.full(N_NUMBERS, np.nan, dtype=np.float64)
+    last_digit_gap = tail_intervals[step_idx, _LAST_DIGITS].astype(np.int32)
 
     return {
         "overall_appearance_rate": overall_rate,
         "set_ball_past_draws": np.full(N_NUMBERS, sb_draws, dtype=np.int32),
         "set_ball_appearance_rate": sb_rate,
+        "set_ball_recent_30_rate": sb_rec30_rate,
+        "set_ball_recent_50_rate": sb_rec50_rate,
         "set_ball_rate_diff": sb_diff_global,
         "set_ball_rate_diff_vs_num_avg": sb_diff_vs_num,
         "interval": interval_vec,
         "recent_5_count": recent_5,
         "recent_10_count": recent_10,
+        "recent_24_count": recent_24,
         "recent_30_count": recent_30,
         "is_pull": is_pull,
+        "is_lag2_repeat": is_lag2_repeat,
         "is_slide": is_slide,
         "is_slide_minus1": is_slide_minus1,
         "is_slide_plus1": is_slide_plus1,
+        "is_prev_consec_pull": is_prev_consec_pull,
+        "is_prev_consec_slide": is_prev_consec_slide,
+        "last_digit_recent_24_rate": last_digit_recent_24_rate,
+        "last_digit_gap": last_digit_gap,
+        "prev_decade_count": prev_decade_count,
     }
 
 
@@ -245,7 +344,9 @@ def generate_features(
     set_balls = df["set_ball"].to_numpy()
     sb_indices = np.array([SET_BALL_TO_IDX[sb] for sb in set_balls], dtype=np.int32)
 
-    cum_all, cum_sb_appear, cum_sb_draws, intervals = _compute_prefix_states(appear_mat, sb_indices)
+    cum_all, cum_sb_appear, cum_sb_draws, intervals, sb_seq_cum, tail_intervals = _compute_prefix_states(
+        appear_mat, sb_indices
+    )
     ref_set_balls = _resolve_ref_set_balls(set_balls, set_ball_mode, target_set_ball)
 
     draw_nos = df["draw_no"].to_numpy(dtype=np.int32)
@@ -264,14 +365,8 @@ def generate_features(
     out_past_draws = np.empty(total_rows, dtype=np.int32)
     out_target = np.empty(total_rows, dtype=np.int32)
 
-    float_cols = {
-        "overall_appearance_rate",
-        "set_ball_appearance_rate",
-        "set_ball_rate_diff",
-        "set_ball_rate_diff_vs_num_avg",
-    }
     feature_arrays: dict[str, np.ndarray] = {
-        col: np.empty(total_rows, dtype=np.float64 if col in float_cols else np.int32)
+        col: np.empty(total_rows, dtype=np.float64 if col in FLOAT_FEATURE_COLS else np.int32)
         for col in FEATURE_COLS
     }
 
@@ -293,6 +388,8 @@ def generate_features(
             cum_sb_appear=cum_sb_appear,
             cum_sb_draws=cum_sb_draws,
             intervals=intervals,
+            sb_seq_cum=sb_seq_cum,
+            tail_intervals=tail_intervals,
             ref_set_ball=ref_sb,
         )
         for col in FEATURE_COLS:
@@ -334,7 +431,9 @@ def build_next_draw_features(
     set_balls = df["set_ball"].to_numpy()
     sb_indices = np.array([SET_BALL_TO_IDX[sb] for sb in set_balls], dtype=np.int32)
 
-    cum_all, cum_sb_appear, cum_sb_draws, intervals = _compute_prefix_states(appear_mat, sb_indices)
+    cum_all, cum_sb_appear, cum_sb_draws, intervals, sb_seq_cum, tail_intervals = _compute_prefix_states(
+        appear_mat, sb_indices
+    )
 
     if target_set_ball is not None:
         ref_sb = target_set_ball.strip().upper()
@@ -350,6 +449,8 @@ def build_next_draw_features(
         cum_sb_appear=cum_sb_appear,
         cum_sb_draws=cum_sb_draws,
         intervals=intervals,
+        sb_seq_cum=sb_seq_cum,
+        tail_intervals=tail_intervals,
         ref_set_ball=ref_sb,
     )
 
@@ -381,7 +482,9 @@ def build_next_draw_features_all_set_balls(
     appear_mat = _build_appearance_matrix(df)
     set_balls = df["set_ball"].to_numpy()
     sb_indices = np.array([SET_BALL_TO_IDX[sb] for sb in set_balls], dtype=np.int32)
-    cum_all, cum_sb_appear, cum_sb_draws, intervals = _compute_prefix_states(appear_mat, sb_indices)
+    cum_all, cum_sb_appear, cum_sb_draws, intervals, sb_seq_cum, tail_intervals = _compute_prefix_states(
+        appear_mat, sb_indices
+    )
 
     next_draw_no = int(df["draw_no"].max()) + 1
     draw_no_arr = np.full(N_NUMBERS, next_draw_no, dtype=np.int32)
@@ -397,6 +500,8 @@ def build_next_draw_features_all_set_balls(
             cum_sb_appear=cum_sb_appear,
             cum_sb_draws=cum_sb_draws,
             intervals=intervals,
+            sb_seq_cum=sb_seq_cum,
+            tail_intervals=tail_intervals,
             ref_set_ball=sb,
         )
         out[sb] = pd.DataFrame(
@@ -409,6 +514,95 @@ def build_next_draw_features_all_set_balls(
             }
         )
     return out
+
+
+def compute_previous_draw_profile(
+    history_df: pd.DataFrame,
+    already_validated: bool = False,
+) -> dict[str, object]:
+    """Summarize the latest draw's structure & 24-draw context for next-draw profiling."""
+    df = history_df if already_validated else validate_history_df(history_df)
+    if df.empty:
+        raise ValueError("history_df が空のため前回プロファイルを作成できません。")
+
+    latest = df.iloc[-1]
+    prev_nums = sorted(int(latest[c]) for c in MAIN_NUM_COLS)
+    prev_set = set(prev_nums)
+    prev_sum = int(sum(prev_nums))
+    prev_odd = int(sum(n % 2 for n in prev_nums))
+    prev_consec = [(prev_nums[i], prev_nums[i + 1]) for i in range(5) if prev_nums[i + 1] == prev_nums[i] + 1]
+    slide_nums = sorted({x + d for x in prev_set for d in (-1, 1) if NUM_MIN <= x + d <= NUM_MAX} - prev_set)
+    lag2_nums = sorted(int(df.iloc[-2][c]) for c in MAIN_NUM_COLS) if len(df) >= 2 else []
+
+    decade_labels = ["01-09", "10-19", "20-29", "30-39", "40-43"]
+    decade_counts = {lbl: 0 for lbl in decade_labels}
+    for n in prev_nums:
+        decade_counts[decade_labels[n // 10]] += 1
+
+    # Last-digit stats over past 24 draws & consecutive miss streaks
+    last24 = df.tail(24)
+    tail_24_counts = {d: 0 for d in range(10)}
+    for _, r in last24.iterrows():
+        for c in MAIN_NUM_COLS:
+            tail_24_counts[int(r[c]) % 10] += 1
+
+    tail_gaps: dict[int, int] = {}
+    for d in range(10):
+        gap = 0
+        for idx in range(len(df) - 1, -1, -1):
+            row_nums = [int(df.iloc[idx][c]) for c in MAIN_NUM_COLS]
+            if any(x % 10 == d for x in row_nums):
+                break
+            gap += 1
+        tail_gaps[d] = gap
+
+    prev_tails = [n % 10 for n in prev_nums]
+    prev_dup_tails = sorted({d for d in prev_tails if prev_tails.count(d) >= 2})
+
+    # Empirical next-draw sum distribution conditioned on previous sum zone
+    all_sums = df[MAIN_NUM_COLS].sum(axis=1).to_numpy(dtype=int)
+    if prev_sum >= 160:
+        zone_label = "前回160以上"
+        mask = all_sums[:-1] >= 160
+    elif prev_sum <= 105:
+        zone_label = "前回105以下"
+        mask = all_sums[:-1] <= 105
+    else:
+        zone_label = "前回標準域 (106〜159)"
+        mask = (all_sums[:-1] > 105) & (all_sums[:-1] < 160)
+
+    cond_next_sums = all_sums[1:][mask] if len(all_sums) > 1 else np.array([], dtype=int)
+    if len(cond_next_sums) > 0:
+        next_sum_mean = float(np.mean(cond_next_sums))
+        next_in_120_150_pct = float(((cond_next_sums >= 120) & (cond_next_sums <= 150)).mean() * 100.0)
+        next_in_100_165_pct = float(((cond_next_sums >= 100) & (cond_next_sums <= 165)).mean() * 100.0)
+    else:
+        next_sum_mean = 132.0
+        next_in_120_150_pct = 40.0
+        next_in_100_165_pct = 70.0
+
+    return {
+        "draw_no": int(latest["draw_no"]),
+        "draw_date": str(latest["draw_date"]),
+        "numbers": prev_nums,
+        "bonus": int(latest["bonus"]),
+        "set_ball": str(latest["set_ball"]),
+        "sum_value": prev_sum,
+        "odd_count": prev_odd,
+        "even_count": 6 - prev_odd,
+        "consecutive_pairs": prev_consec,
+        "slide_candidates": slide_nums,
+        "lag2_numbers": lag2_nums,
+        "decade_counts": decade_counts,
+        "prev_dup_tails": prev_dup_tails,
+        "tail_24_counts": tail_24_counts,
+        "tail_gaps": tail_gaps,
+        "cond_zone_label": zone_label,
+        "cond_sample_n": int(len(cond_next_sums)),
+        "cond_next_sum_mean": next_sum_mean,
+        "cond_next_120_150_pct": next_in_120_150_pct,
+        "cond_next_100_165_pct": next_in_100_165_pct,
+    }
 
 
 def compute_set_ball_summary(
